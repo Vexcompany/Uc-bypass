@@ -14,20 +14,34 @@ export const SPOOFED_HEADERS: Record<string, string> = {
   "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
 };
 
-/** Headers used when talking to UC Drive cloud API (pc-api.uc.cn). */
-export const UC_API_HEADERS: Record<string, string> = {
+/** Headers for UC Drive international API (m-intldrive.ucweb.com / uc-share.com). */
+export const UC_INTL_API_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Content-Type": "application/json",
+  Origin: "https://drive.ucweb.com",
+  Referer: "https://drive.ucweb.com/",
+  "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+};
+
+/** Headers for UC Drive China API (pc-api.uc.cn / drive.uc.cn). */
+export const UC_CN_API_HEADERS: Record<string, string> = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
   "Content-Type": "application/json;charset=UTF-8",
   Origin: "https://drive.uc.cn",
   Referer: "https://drive.uc.cn/",
-  "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 };
+
+/** @deprecated use UC_INTL_API_HEADERS or UC_CN_API_HEADERS */
+export const UC_API_HEADERS = UC_INTL_API_HEADERS;
 
 /** Comma-separated allowlist of page hosts the extractor may fetch (env-overridable). */
 export const DEFAULT_ALLOWED_PAGE_HOSTS =
-  "uc-share.com,drive.uc.cn,fast.uc.cn,pan.uc.cn";
+  "uc-share.com,drive.ucweb.com,drive.uc.cn,fast.uc.cn,pan.uc.cn";
 
 export function allowedPageHosts(): string[] {
   const raw =
@@ -59,19 +73,27 @@ export function parsePageUrl(raw: string): URL | null {
   return ok ? url : null;
 }
 
+/** True when the share page is on the international UC Drive stack. */
+export function isIntlShareHost(pageUrl: URL): boolean {
+  const host = pageUrl.hostname.toLowerCase().replace(/^www\./, "");
+  return (
+    host === "uc-share.com" ||
+    host.endsWith(".uc-share.com") ||
+    host === "drive.ucweb.com" ||
+    host.endsWith(".ucweb.com")
+  );
+}
+
 /**
  * Extract share pwd_id from common UC share URL shapes:
  *   https://uc-share.com/s/xxxxx
+ *   https://drive.ucweb.com/s/xxxxx
  *   https://drive.uc.cn/s/xxxxx
- *   https://fast.uc.cn/s/xxxxx
- *   https://pan.uc.cn/s/xxxxx
  */
 export function extractShareId(pageUrl: URL): string | null {
   const path = pageUrl.pathname.replace(/\/+$/, "");
-  // /s/{id} or /s/{id}/...
   const m = path.match(/\/s\/([A-Za-z0-9_-]+)/i);
   if (m) return m[1];
-  // fallback: last path segment if it looks like an id
   const seg = path.split("/").filter(Boolean).pop() || "";
   if (/^[A-Za-z0-9_-]{6,}$/.test(seg)) return seg;
   return null;
@@ -106,11 +128,6 @@ function isPrivateV4(host: string): boolean {
   return PRIVATE_V4.some((re) => re.test(host));
 }
 
-/**
- * A safe proxy target must be a public http(s) endpoint on a standard port.
- * Blocks loopback/private/link-local/CGNAT ranges, cloud metadata, and
- * credentials-in-URL tricks.
- */
 export function isSafeProxyTarget(url: URL): boolean {
   if (!/^https?:$/.test(url.protocol)) return false;
   if (url.username || url.password) return false;
@@ -127,7 +144,6 @@ export function isSafeProxyTarget(url: URL): boolean {
   if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal"))
     return false;
 
-  // Metadata endpoints (GCP/AWS/Azure) regardless of shape.
   if (
     host === "metadata.google.internal" ||
     host === "169.254.169.254" ||
@@ -135,23 +151,17 @@ export function isSafeProxyTarget(url: URL): boolean {
   )
     return false;
 
-  // Plain IPv4
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return !isPrivateV4(host);
 
-  // IPv6 literal
   if (host.includes(":")) {
     if (host === "::1" || host === "::") return false;
-    const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i); // IPv4-mapped
+    const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
     if (mapped) return !isPrivateV4(mapped[1]);
-    if (/^f[cd][0-9a-f]{0,2}(:|$)/.test(host)) return false; // fc00::/7 unique-local
-    if (/^fe[89ab][0-9a-f]{0,2}(:|$)/.test(host)) return false; // fe80::/10 link-local
+    if (/^f[cd][0-9a-f]{0,2}(:|$)/.test(host)) return false;
+    if (/^fe[89ab][0-9a-f]{0,2}(:|$)/.test(host)) return false;
   }
   return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* Small formatting helpers (shared by API + UI)                       */
-/* ------------------------------------------------------------------ */
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
