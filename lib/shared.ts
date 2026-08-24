@@ -1,0 +1,137 @@
+/**
+ * Shared, dependency-free helpers used by both serverless route handlers.
+ * Kept free of Node-only / cheerio imports so the proxy route stays lightweight
+ * (it could be flipped to the Edge runtime by changing one line — see route file).
+ */
+
+/** Exact header set required by uc-share.com's bot/hotlink filters. */
+export const SPOOFED_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Linux; U; Android 10; id-id; Redmi Note 8 Build/QKQ1.200114.002) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/88.0.4324.181 Mobile Safari/537.36 UCBrowser/13.4.0.1306",
+  Referer: "https://uc-share.com/",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+  "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+};
+
+/** Comma-separated allowlist of page hosts the extractor may fetch (env-overridable). */
+export const DEFAULT_ALLOWED_PAGE_HOSTS = "uc-share.com";
+
+export function allowedPageHosts(): string[] {
+  const raw =
+    process.env.UCSHARE_ALLOWED_HOSTS?.trim() || DEFAULT_ALLOWED_PAGE_HOSTS;
+  return raw
+    .split(",")
+    .map((h) => h.trim().toLowerCase().replace(/^www\./, ""))
+    .filter(Boolean);
+}
+
+/**
+ * Validate that `raw` is a well-formed http(s) URL on an allowlisted
+ * uc-share style origin. Returns the parsed URL or null.
+ */
+export function parsePageUrl(raw: string): URL | null {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    return null;
+  }
+  if (!/^https?:$/.test(url.protocol)) return null;
+  if (url.username || url.password) return null;
+
+  const host = url.hostname.toLowerCase().replace(/^www\./, "");
+  const ok = allowedPageHosts().some(
+    (allowed) => host === allowed || host.endsWith(`.${allowed}`),
+  );
+  return ok ? url : null;
+}
+
+/* ------------------------------------------------------------------ */
+/* SSRF guards for the proxy route (best-effort, no DNS resolution)    */
+/* ------------------------------------------------------------------ */
+
+const PRIVATE_V4 = [
+  /^0\./,
+  /^10\./,
+  /^127\./,
+  /^169\.254\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^255\.255\.255\.255$/,
+];
+
+function isPrivateV4(host: string): boolean {
+  return PRIVATE_V4.some((re) => re.test(host));
+}
+
+/**
+ * A safe proxy target must be a public http(s) endpoint on a standard port.
+ * Blocks loopback/private/link-local/CGNAT ranges, cloud metadata, and
+ * credentials-in-URL tricks.
+ */
+export function isSafeProxyTarget(url: URL): boolean {
+  if (!/^https?:$/.test(url.protocol)) return false;
+  if (url.username || url.password) return false;
+
+  const port = url.port === ""
+    ? url.protocol === "https:"
+      ? 443
+      : 80
+    : Number(url.port);
+  if (port !== 80 && port !== 443) return false;
+
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+
+  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal"))
+    return false;
+
+  // Metadata endpoints (GCP/AWS/Azure) regardless of shape.
+  if (
+    host === "metadata.google.internal" ||
+    host === "169.254.169.254" ||
+    host === "100.100.100.200"
+  )
+    return false;
+
+  // Plain IPv4
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return !isPrivateV4(host);
+
+  // IPv6 literal
+  if (host.includes(":")) {
+    if (host === "::1" || host === "::") return false;
+    const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i); // IPv4-mapped
+    if (mapped) return !isPrivateV4(mapped[1]);
+    if (/^f[cd][0-9a-f]{0,2}(:|$)/.test(host)) return false; // fc00::/7 unique-local
+    if (/^fe[89ab][0-9a-f]{0,2}(:|$)/.test(host)) return false; // fe80::/10 link-local
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Small formatting helpers (shared by API + UI)                       */
+/* ------------------------------------------------------------------ */
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(
+    units.length - 1,
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+  );
+  const value = bytes / 1024 ** i;
+  return `${value >= 100 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
+}
+
+export function sanitizeFilename(name: string): string {
+  const cleaned = name
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[. ]+|[. ]+$/g, "");
+  return (cleaned || "ucshare-media").slice(0, 120);
+}
+
+export function asciiFallback(name: string): string {
+  return name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+}
