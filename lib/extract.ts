@@ -1,11 +1,26 @@
 import * as cheerio from "cheerio";
-import { SPOOFED_HEADERS, formatBytes } from "@/lib/shared";
+import {
+  SPOOFED_HEADERS,
+  UC_API_HEADERS,
+  extractPasscode,
+  extractShareId,
+  formatBytes,
+} from "@/lib/shared";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
 /* ------------------------------------------------------------------ */
 
 export type MediaType = "video" | "file";
+
+export interface FileEntry {
+  name: string;
+  directUrl: string;
+  mediaType: MediaType;
+  size?: string;
+  sizeBytes?: number;
+  isFolder?: boolean;
+}
 
 export interface ExtractedMedia {
   directUrl: string;
@@ -15,6 +30,10 @@ export interface ExtractedMedia {
   resolution?: string;
   /** Human-readable description of which extraction tier produced the hit. */
   method: string;
+  /** When the share is a folder (or multi-file), every resolved media file. */
+  files?: FileEntry[];
+  /** True when the share root is a folder listing. */
+  isFolder?: boolean;
 }
 
 export class ExtractionError extends Error {
@@ -33,7 +52,7 @@ interface Candidate {
   label: string;
 }
 
-type Tier = "tag" | "meta" | "script" | "anchor" | "regex";
+type Tier = "api" | "tag" | "meta" | "script" | "anchor" | "regex";
 
 /* ------------------------------------------------------------------ */
 /* Extension knowledge                                                 */
@@ -56,7 +75,7 @@ const EXT_PRIORITY: Record<string, number> = {
   ts: 30, avi: 30, flv: 25, ogv: 25, "3gp": 20,
 };
 const TIER_PRIORITY: Record<Tier, number> = {
-  tag: 40, meta: 35, script: 30, anchor: 25, regex: 20,
+  api: 50, tag: 40, meta: 35, script: 30, anchor: 25, regex: 20,
 };
 
 /* ------------------------------------------------------------------ */
@@ -88,6 +107,11 @@ function extOf(url: URL): string | null {
     /* keep raw */
   }
   const m = path.match(/\.([a-z0-9]{1,5})$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function extFromName(name: string): string | null {
+  const m = name.match(/\.([a-z0-9]{1,5})$/i);
   return m ? m[1].toLowerCase() : null;
 }
 
@@ -126,6 +150,348 @@ function pushCandidate(
 ): void {
   const u = toMediaUrl(raw, base);
   if (u) out.push({ url: u, ext: extOf(u) as string, tier, label });
+}
+
+/* ------------------------------------------------------------------ */
+/* UC Drive official share API (supports folders)                      */
+/* ------------------------------------------------------------------ */
+
+const UC_API = "https://pc-api.uc.cn/1/clouddrive";
+const MAX_FOLDER_DEPTH = 3;
+const MAX_FILES_PER_DIR = 100;
+const MAX_TOTAL_FILES = 40;
+
+interface UcListItem {
+  fid: string;
+  file_name: string;
+  size?: number;
+  dir?: boolean;
+  file_type?: number; // 0/1 folder, 1 file depending on API variant
+  share_fid_token?: string;
+  pdir_fid?: string;
+  include_items?: number;
+}
+
+async function ucFetchJson(
+  url: string,
+  init?: RequestInit,
+): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch(url, {
+      ...init,
+      headers: { ...UC_API_HEADERS, ...(init?.headers as Record<string, string> | undefined) },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new ExtractionError(
+        `UC API responded with HTTP ${res.status}.`,
+        res.status === 404 ? 404 : 502,
+      );
+    }
+    return (await res.json()) as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof ExtractionError) throw err;
+    if (controller.signal.aborted) {
+      throw new ExtractionError("UC API took too long to respond.", 504);
+    }
+    throw new ExtractionError("Could not reach UC Drive API.", 502);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function ucGetStoken(pwdId: string, passcode: string): Promise<string> {
+  const url = `${UC_API}/share/sharepage/token?entry=ft&fr=pc&pr=UCBrowser`;
+  const body = {
+    share_for_transfer: true,
+    pwd_id: pwdId,
+    passcode: passcode || "",
+  };
+  const json = await ucFetchJson(url, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  const code = json.code as number | undefined;
+  if (code !== 0 && code !== undefined) {
+    const msg = String((json.message as string) || (json.msg as string) || "Unknown error");
+    if (/pass|密码|口令|code/i.test(msg)) {
+      throw new ExtractionError(
+        "This share requires a passcode. Append ?passcode=XXXX to the URL or provide the correct code.",
+        403,
+      );
+    }
+    throw new ExtractionError(`UC share token failed: ${msg}`, 422);
+  }
+  const data = json.data as Record<string, unknown> | undefined;
+  const stoken = data?.stoken as string | undefined;
+  if (!stoken) {
+    throw new ExtractionError("UC API did not return a share token. The link may be expired.", 422);
+  }
+  return stoken;
+}
+
+async function ucListDir(
+  pwdId: string,
+  passcode: string,
+  stoken: string,
+  pdirFid = "0",
+): Promise<UcListItem[]> {
+  const items: UcListItem[] = [];
+  let page = 1;
+  const pageSize = 50;
+
+  while (items.length < MAX_FILES_PER_DIR) {
+    const params = new URLSearchParams({
+      pr: "UCBrowser",
+      fr: "pc",
+      pwd_id: pwdId,
+      passcode: passcode || "",
+      stoken,
+      pdir_fid: pdirFid,
+      force: "0",
+      _page: String(page),
+      _size: String(pageSize),
+      _fetch_banner: "0",
+      _fetch_share: "0",
+      _fetch_total: "1",
+      _sort: "file_type:asc,file_name:asc",
+    });
+
+    // Prefer transfer_share/detail (works for public shares); fall back to sharepage/detail
+    let json: Record<string, unknown>;
+    try {
+      json = await ucFetchJson(
+        `${UC_API}/share/sharepage/detail?${params.toString()}`,
+      );
+    } catch {
+      json = await ucFetchJson(
+        `${UC_API}/transfer_share/detail?${params.toString()}`,
+      );
+    }
+
+    const code = json.code as number | undefined;
+    if (code !== 0 && code !== undefined) {
+      const msg = String((json.message as string) || (json.msg as string) || "list failed");
+      throw new ExtractionError(`UC folder list failed: ${msg}`, 422);
+    }
+
+    const data = json.data as Record<string, unknown> | undefined;
+    const list = (data?.list as UcListItem[]) || [];
+    items.push(...list);
+
+    const meta = json.metadata as Record<string, unknown> | undefined;
+    const total = Number(meta?._total ?? list.length);
+    if (items.length >= total || list.length < pageSize) break;
+    page += 1;
+    if (page > 10) break; // safety
+  }
+
+  return items.slice(0, MAX_FILES_PER_DIR);
+}
+
+async function ucGetDownloadUrls(
+  pwdId: string,
+  stoken: string,
+  files: { fid: string; share_fid_token: string }[],
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (files.length === 0) return out;
+
+  // Batch in chunks of 10
+  for (let i = 0; i < files.length; i += 10) {
+    const chunk = files.slice(i, i + 10);
+    const body = {
+      fids: chunk.map((f) => f.fid),
+      pwd_id: pwdId,
+      stoken,
+      fids_token: chunk.map((f) => f.share_fid_token),
+    };
+    const url = `${UC_API}/file/download?entry=ft&fr=pc&pr=UCBrowser`;
+    try {
+      const json = await ucFetchJson(url, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      const code = json.code as number | undefined;
+      if (code !== 0 && code !== undefined) continue;
+      const data = json.data as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(data)) continue;
+      for (const row of data) {
+        const fid = String(row.fid ?? "");
+        const dl =
+          (row.download_url as string) ||
+          (row.downloadUrl as string) ||
+          (row.url as string) ||
+          "";
+        if (fid && dl) out.set(fid, dl);
+      }
+    } catch {
+      /* try next chunk */
+    }
+  }
+  return out;
+}
+
+function isDirItem(item: UcListItem): boolean {
+  if (item.dir === true) return true;
+  // file_type: 0 often means folder in UC/Quark-like APIs
+  if (item.file_type === 0) return true;
+  if (item.include_items != null && item.include_items > 0 && !extFromName(item.file_name || ""))
+    return true;
+  return false;
+}
+
+async function extractViaUcApi(
+  pageUrl: URL,
+  passcodeOverride?: string,
+): Promise<ExtractedMedia | null> {
+  const pwdId = extractShareId(pageUrl);
+  if (!pwdId) return null;
+
+  const passcode = extractPasscode(pageUrl, passcodeOverride);
+
+  let stoken: string;
+  try {
+    stoken = await ucGetStoken(pwdId, passcode);
+  } catch (err) {
+    // If API is blocked / needs login, let HTML fallback try
+    if (err instanceof ExtractionError && (err.status === 403 || err.status === 422)) {
+      // passcode errors should surface
+      if (/passcode|password|口令|密码/i.test(err.message)) throw err;
+    }
+    return null;
+  }
+
+  // BFS folder walk
+  type Queued = { fid: string; depth: number; pathPrefix: string };
+  const queue: Queued[] = [{ fid: "0", depth: 0, pathPrefix: "" }];
+  const mediaFiles: {
+    name: string;
+    path: string;
+    fid: string;
+    share_fid_token: string;
+    size?: number;
+    ext: string;
+  }[] = [];
+  let sawFolder = false;
+  let rootTitle: string | undefined;
+
+  while (queue.length > 0 && mediaFiles.length < MAX_TOTAL_FILES) {
+    const cur = queue.shift()!;
+    if (cur.depth > MAX_FOLDER_DEPTH) continue;
+
+    let list: UcListItem[];
+    try {
+      list = await ucListDir(pwdId, passcode, stoken, cur.fid);
+    } catch {
+      continue;
+    }
+
+    if (cur.depth === 0 && list.length === 1 && isDirItem(list[0])) {
+      // Share root is a single folder — treat as folder share
+      sawFolder = true;
+      rootTitle = list[0].file_name;
+      queue.push({
+        fid: list[0].fid,
+        depth: cur.depth + 1,
+        pathPrefix: list[0].file_name || "",
+      });
+      continue;
+    }
+
+    for (const item of list) {
+      if (isDirItem(item)) {
+        sawFolder = true;
+        if (cur.depth < MAX_FOLDER_DEPTH) {
+          queue.push({
+            fid: item.fid,
+            depth: cur.depth + 1,
+            pathPrefix: cur.pathPrefix
+              ? `${cur.pathPrefix}/${item.file_name}`
+              : item.file_name,
+          });
+        }
+        continue;
+      }
+
+      const name = item.file_name || "file";
+      const ext = extFromName(name);
+      // Accept known media/file extensions; also accept unknown with size (generic file)
+      if (ext && isMediaExt(ext)) {
+        mediaFiles.push({
+          name,
+          path: cur.pathPrefix ? `${cur.pathPrefix}/${name}` : name,
+          fid: item.fid,
+          share_fid_token: item.share_fid_token || "",
+          size: item.size,
+          ext,
+        });
+      } else if (!ext || item.size) {
+        // Generic file without recognized extension — still try download
+        mediaFiles.push({
+          name,
+          path: cur.pathPrefix ? `${cur.pathPrefix}/${name}` : name,
+          fid: item.fid,
+          share_fid_token: item.share_fid_token || "",
+          size: item.size,
+          ext: ext || "bin",
+        });
+      }
+
+      if (mediaFiles.length >= MAX_TOTAL_FILES) break;
+    }
+  }
+
+  if (mediaFiles.length === 0) {
+    return null;
+  }
+
+  // Rank: prefer video/mp4
+  mediaFiles.sort((a, b) => {
+    const sa = (EXT_PRIORITY[a.ext] ?? 10) * 10;
+    const sb = (EXT_PRIORITY[b.ext] ?? 10) * 10;
+    return sb - sa;
+  });
+
+  const withToken = mediaFiles.filter((f) => f.share_fid_token);
+  const downloadMap = await ucGetDownloadUrls(
+    pwdId,
+    stoken,
+    withToken.map((f) => ({ fid: f.fid, share_fid_token: f.share_fid_token })),
+  );
+
+  const resolved: FileEntry[] = [];
+  for (const f of mediaFiles) {
+    const dl = downloadMap.get(f.fid);
+    if (!dl) continue;
+    resolved.push({
+      name: f.path || f.name,
+      directUrl: dl,
+      mediaType: classify(f.ext),
+      size: f.size != null && f.size > 0 ? formatBytes(f.size) : undefined,
+      sizeBytes: f.size,
+    });
+  }
+
+  if (resolved.length === 0) {
+    // API listed files but download tokens failed — signal fallback
+    return null;
+  }
+
+  const best = resolved[0];
+  return {
+    directUrl: best.directUrl,
+    mediaType: best.mediaType,
+    title: rootTitle || (sawFolder ? `Folder (${resolved.length} files)` : best.name),
+    size: best.size,
+    method: sawFolder
+      ? "UC Drive API (folder listing)"
+      : "UC Drive API (share detail)",
+    files: resolved.length > 1 ? resolved : undefined,
+    isFolder: sawFolder || resolved.length > 1,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -369,10 +735,10 @@ async function probeMedia(url: URL): Promise<{ size?: string }> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Public entry point                                                  */
+/* HTML fallback extraction                                            */
 /* ------------------------------------------------------------------ */
 
-export async function extractFromPage(pageUrl: URL): Promise<ExtractedMedia> {
+async function extractFromHtml(pageUrl: URL): Promise<ExtractedMedia> {
   let res: Response;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
@@ -427,7 +793,7 @@ export async function extractFromPage(pageUrl: URL): Promise<ExtractedMedia> {
   const best = pickBest(candidates);
   if (!best) {
     throw new ExtractionError(
-      "No direct media link was found on this page. The content may require JavaScript rendering, or the share has expired.",
+      "No direct media link was found on this page. The content may be a folder share (try again — folder API may need a passcode), require JavaScript rendering, or the share has expired.",
       422,
     );
   }
@@ -442,4 +808,32 @@ export async function extractFromPage(pageUrl: URL): Promise<ExtractedMedia> {
     resolution: extractResolution(html),
     method: best.label,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Public entry point                                                  */
+/* ------------------------------------------------------------------ */
+
+export async function extractFromPage(
+  pageUrl: URL,
+  options?: { passcode?: string },
+): Promise<ExtractedMedia> {
+  // 1) Prefer official UC Drive API — handles single files AND folders
+  try {
+    const apiResult = await extractViaUcApi(pageUrl, options?.passcode);
+    if (apiResult) return apiResult;
+  } catch (err) {
+    // Surface passcode / explicit API errors; otherwise fall through to HTML
+    if (err instanceof ExtractionError && err.status === 403) throw err;
+    if (
+      err instanceof ExtractionError &&
+      /passcode|password|口令|密码/i.test(err.message)
+    ) {
+      throw err;
+    }
+    // other API failures → HTML fallback
+  }
+
+  // 2) HTML multi-tier scrape (legacy path / non-API pages)
+  return extractFromHtml(pageUrl);
 }

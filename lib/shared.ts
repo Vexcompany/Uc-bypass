@@ -14,8 +14,20 @@ export const SPOOFED_HEADERS: Record<string, string> = {
   "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
 };
 
+/** Headers used when talking to UC Drive cloud API (pc-api.uc.cn). */
+export const UC_API_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Content-Type": "application/json;charset=UTF-8",
+  Origin: "https://drive.uc.cn",
+  Referer: "https://drive.uc.cn/",
+  "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+};
+
 /** Comma-separated allowlist of page hosts the extractor may fetch (env-overridable). */
-export const DEFAULT_ALLOWED_PAGE_HOSTS = "uc-share.com";
+export const DEFAULT_ALLOWED_PAGE_HOSTS =
+  "uc-share.com,drive.uc.cn,fast.uc.cn,pan.uc.cn";
 
 export function allowedPageHosts(): string[] {
   const raw =
@@ -45,6 +57,35 @@ export function parsePageUrl(raw: string): URL | null {
     (allowed) => host === allowed || host.endsWith(`.${allowed}`),
   );
   return ok ? url : null;
+}
+
+/**
+ * Extract share pwd_id from common UC share URL shapes:
+ *   https://uc-share.com/s/xxxxx
+ *   https://drive.uc.cn/s/xxxxx
+ *   https://fast.uc.cn/s/xxxxx
+ *   https://pan.uc.cn/s/xxxxx
+ */
+export function extractShareId(pageUrl: URL): string | null {
+  const path = pageUrl.pathname.replace(/\/+$/, "");
+  // /s/{id} or /s/{id}/...
+  const m = path.match(/\/s\/([A-Za-z0-9_-]+)/i);
+  if (m) return m[1];
+  // fallback: last path segment if it looks like an id
+  const seg = path.split("/").filter(Boolean).pop() || "";
+  if (/^[A-Za-z0-9_-]{6,}$/.test(seg)) return seg;
+  return null;
+}
+
+/** Passcode from ?passcode= / ?pwd= / ?code= query, or empty string. */
+export function extractPasscode(pageUrl: URL, override?: string): string {
+  if (typeof override === "string") return override.trim();
+  const q =
+    pageUrl.searchParams.get("passcode") ||
+    pageUrl.searchParams.get("pwd") ||
+    pageUrl.searchParams.get("code") ||
+    "";
+  return q.trim();
 }
 
 /* ------------------------------------------------------------------ */
